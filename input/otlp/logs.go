@@ -37,15 +37,16 @@ package otlp
 import (
 	"context"
 	"encoding/hex"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/elastic/apm-data/model/modelpb"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	semconv "go.opentelemetry.io/collector/semconv/v1.5.0"
 	"go.uber.org/zap"
-
-	"github.com/elastic/apm-data/model/modelpb"
+	structpb "google.golang.org/protobuf/types/known/structpb"
 )
 
 // ConsumeLogsResult contains the number of rejected log records and error message for partial success response.
@@ -198,6 +199,24 @@ func (c *Consumer) convertLogRecord(
 				event.DataStream = modelpb.DataStreamFromVTPool()
 			}
 			event.DataStream.Namespace = v.Str()
+		case "stacktrace.threads":
+			if event.Error == nil {
+				event.Error = modelpb.ErrorFromVTPool()
+			}
+			if event.Error.Exception == nil {
+				event.Error.Exception = modelpb.ExceptionFromVTPool()
+			}
+			images, _ := attrs.Get("stacktrace.images")
+			parseThreads(v.Slice(), images.Slice(), event.Error.Exception)
+			event.Error.Exception.Message = exceptionMessage
+			event.Error.Exception.Type = exceptionType
+			handled := false
+			event.Error.Exception.Handled = &handled
+			event.Error.StackTrace = exceptionStacktrace
+			if id, err := newUniqueID(); err == nil {
+				event.Error.Id = id
+			}
+
 		default:
 			setLabel(replaceDots(k), event, ifaceAttributeValue(v))
 		}
@@ -205,12 +224,13 @@ func (c *Consumer) convertLogRecord(
 	})
 
 	// NOTE: we consider an error anything that contains an exception type
-	// or message, indipendently from the severity level.
-	if exceptionMessage != "" || exceptionType != "" {
+	// or message, independent of the severity level.
+	if (exceptionMessage != "" || exceptionType != "") && event.Service.Language.Name != "swift" {
 		event.Error = convertOpenTelemetryExceptionSpanEvent(
 			exceptionType, exceptionMessage, exceptionStacktrace,
 			exceptionEscaped, event.Service.Language.Name,
 		)
+
 	}
 
 	// We need to check if the "event.name" has the "device" prefix based on the removal of the "event.domain" attribute
@@ -235,6 +255,58 @@ func (c *Consumer) convertLogRecord(
 	}
 
 	return event
+}
+
+func parseThreads(thread pcommon.Slice, images pcommon.Slice, out *modelpb.Exception) {
+	thread0 := thread.At(0).Slice()
+	for i := 0; i < thread0.Len(); i++ {
+		outFrame := modelpb.StacktraceFrameFromVTPool()
+		outFrame.Function = thread0.At(i).Str()
+		numberStr := strings.Replace(outFrame.Function, "0x", "", -1)
+		if addr, err := strconv.ParseUint(numberStr, 16, 64); err == nil {
+			for j := 0; j < images.Len(); j++ {
+				image := images.At(j).Map()
+				if baseAddrValue, success := image.Get("baseAddress"); success {
+					baseAddrStr := strings.Replace(baseAddrValue.Str(), "0x", "", -1)
+					if baseAddr, err := strconv.ParseUint(baseAddrStr, 16, 64); err == nil {
+						if sizeStr, success := image.Get("imageSize"); success {
+							if buildId, success := image.Get("imageUUID"); success {
+								if size, err := strconv.ParseUint(sizeStr.Str(), 10, 64); err == nil {
+									if addr-baseAddr < size {
+										buildIdKV := modelpb.KeyValueFromVTPool()
+										buildIdKV.Key = "buildId"
+										buildIdKV.Value = structpb.NewStringValue(buildId.Str())
+										outFrame.Vars = append(outFrame.Vars, buildIdKV)
+
+										baseAddressKV := modelpb.KeyValueFromVTPool()
+										baseAddressKV.Key = "baseAddress"
+										baseAddressKV.Value  = structpb.NewStringValue(baseAddrValue.Str())
+										outFrame.Vars = append(outFrame.Vars, baseAddressKV)
+
+										imageSizeKV := modelpb.KeyValueFromVTPool()
+										imageSizeKV.Key = "imageSize"
+										imageSizeKV.Value  = structpb.NewStringValue(sizeStr.Str())
+										outFrame.Vars = append(outFrame.Vars, imageSizeKV)
+
+										if imageName, success := image.Get("imageName"); success {
+											imageNameKV := modelpb.KeyValueFromVTPool()
+											imageNameKV.Key = "imageName"
+											imageNameKV.Value = structpb.NewStringValue(imageName.Str())
+											outFrame.Vars = append(outFrame.Vars, imageNameKV)
+										}
+
+
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		out.Stacktrace = append(out.Stacktrace, outFrame)
+	}
 }
 
 func setLabels(m pcommon.Map, event *modelpb.APMEvent) {
